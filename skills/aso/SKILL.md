@@ -2,7 +2,13 @@
 name: aso
 description: "When the user wants to audit or optimize an App Store or Google Play listing. Also use when the user mentions 'ASO audit,' 'app store optimization,' 'optimize my app listing,' 'improve app visibility,' 'app store ranking,' 'audit my listing,' 'why aren't people downloading my app,' 'improve my app conversion,' 'keyword optimization for app,' or 'compare my app to competitors.' Use when the user shares an App Store or Google Play URL and wants to improve it."
 metadata:
-  version: 2.0.0
+  version: 2.1.0-local.3
+  localPatches:
+    - "Mandate Astro ASO MCP (mcp__astro__*) as the primary keyword/ranking/competitor source when available"
+    - "Apple: parse the `serialized-server-data` SPA block (`data[0].data.shelfMapping.product_media_phone_.items[]`) as the PRIMARY source for screenshots + preview video. iTunes Lookup is stale on modern apps and silently returns empty."
+    - "Google Play: parse `AF_initDataCallback` block `ds:5` for screenshots, preview video, icon, feature graphic, description, install range, category, last-updated. Concrete paths in `Fetch the listing`. No JSON-LD on Play."
+    - "JSON-LD (Apple only) second for icon + description + aggregateRating; iTunes Lookup third for fields the other two don't expose."
+    - "Forbid scoring visual assets as ?/10 unless the SPA block itself is unreachable; only score 0/10 if the block confirms empty items[]"
 ---
 
 # ASO Audit
@@ -25,6 +31,21 @@ If `.agents/product-marketing.md` exists (or `.claude/product-marketing.md`, or 
 
 ## Phase 1 — Identify Store & Fetch
 
+### Data sources — use in this order
+
+1. **Astro ASO MCP first (when available).** If `mcp__astro__*` tools are exposed, they are the authoritative source for tracked keyword rankings, popularity, difficulty, ratings history, AI keyword suggestions, and competitor app sets. Prefer these over WebFetch for anything keyword-related:
+   - `mcp__astro__list_apps` — confirm the app is tracked and resolve the App Store ID
+   - `mcp__astro__get_app_keywords` — full ranked keyword set with `currentRanking`, `previousRanking`, `rankingChange`, `popularity`, `difficulty`
+   - `mcp__astro__get_app_ratings` — current + historical rating/review counts
+   - `mcp__astro__search_rankings` — per-keyword detail with optional `includeHistory`/`includeStatistics`
+   - `mcp__astro__search_app_store` — top-N apps for a keyword (competitor extraction); pass `appId` to also get your app's position
+   - `mcp__astro__get_keyword_suggestions` — AI-suggested keywords with pop/difficulty
+   - `mcp__astro__extract_competitors_keywords` — keyword ideas mined from competitors ranking for a tracked term
+2. **Apple iTunes Lookup API + Google Play JSON-LD second.** These are programmatic and expose creative URLs (icon, screenshots, preview video) that the rendered page does not — see "Fetch the listing" below.
+3. **WebFetch on the public listing third.** Useful for human-visible truth (placeholder `1x1.gif` blocks vs real screenshots, "What's New" copy, brand voice) but the page renders client-side so it will under-report creatives that ARE live.
+
+If Astro MCP is not available, skip step 1 and proceed with steps 2 and 3.
+
 ### Detect store type from URL
 
 ```
@@ -37,7 +58,86 @@ If the user gives an app name instead of a URL, search the web for:
 
 ### Fetch the listing
 
-Use WebFetch to retrieve the listing page. Extract every available field:
+**Apple — primary source (parse the SPA hydration block).** iTunes Lookup is stale for modern apps and will silently return `screenshotUrls: []` and omit `previewMovieUrl` even when both are live. The reliable source is the App Store SPA's own hydration data, embedded as a `<script>` block on the public listing page.
+
+Fetch the listing HTML with a standard browser User-Agent:
+
+```
+curl -fsSL "https://apps.apple.com/{cc}/app/_/id{APP_ID}" \
+  -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+```
+
+Extract the block:
+
+```python
+import re, json
+m = re.search(r'<script[^>]*id="serialized-server-data"[^>]*>(.*?)</script>', html, re.DOTALL)
+obj = json.loads(m.group(1).strip())
+```
+
+Navigate to `obj["data"][0]["data"]["shelfMapping"]`:
+
+- `product_media_phone_.items[]` — iPhone media in display order. Each item has either a `screenshot` key (image, with `template`, `width`, `height`) or a `video` key (with `videoUrl` pointing to an `.m3u8` and `preview.template` for the poster image). **Count screenshots and check for the video here — do NOT trust iTunes Lookup.**
+- `product_media_pad_.items[]` — iPad media in the same shape.
+- The `template` URL has placeholders like `/{w}x{h}{c}.{f}` — substitute (e.g. `/1290x2796bb.png` or `/600x600wa.webp`) to fetch the actual image.
+
+**Apple — secondary source (JSON-LD).** The listing page also contains a `<script type="application/ld+json">` block with a `SoftwareApplication` schema. Use it for: `name`, `description`, `image` (icon URL), `aggregateRating.ratingValue`, `aggregateRating.reviewCount`, `offers.price`, `applicationCategory`.
+
+**Apple — tertiary source (iTunes Lookup API).** Use this only for fields the other two don't expose: `languageCodesISO2A[]` (every localization), `releaseNotes`, `version`, `currentVersionReleaseDate`, `minimumOsVersion`, `fileSizeBytes`, `contentAdvisoryRating`, `sellerName`, `genres[]`. **Do NOT use it for `screenshotUrls` or `previewMovieUrl`** — those will be empty/missing even when the assets are live.
+
+```
+https://itunes.apple.com/lookup?id={APP_ID}&country={CC}
+```
+
+**Google Play — primary source (parse the `AF_initDataCallback` `ds:5` block).** Play stopped embedding usable JSON-LD years ago. The listing page instead embeds a series of `AF_initDataCallback({key: 'ds:N', ..., data: <JSON>, sideChannel: {}})` calls. Block `ds:5` carries the app detail tree.
+
+Fetch the listing HTML with a standard browser User-Agent (use `&hl=en&gl=us` to pin locale):
+
+```
+curl -fsSL "https://play.google.com/store/apps/details?id={pkg}&hl=en&gl=us" \
+  -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+```
+
+Extract every block, then drill into `ds:5`:
+
+```python
+import re, json
+blocks = {}
+for m in re.finditer(r"AF_initDataCallback\(\{key:\s*'(ds:\d+)'.*?data:\s*(\[.*?\])\s*,\s*sideChannel:", html, re.DOTALL):
+    try: blocks[m.group(1)] = json.loads(m.group(2))
+    except: pass
+ds5 = blocks['ds:5']
+def at(o, *path, default=None):
+    try:
+        for p in path: o = o[p]
+        return o
+    except: return default
+```
+
+Known paths inside `ds:5[1][2]` (battle-tested against `com.mobiletechmedia.realadai` 2026-06-04):
+
+| Field | Path | Notes |
+|---|---|---|
+| Title (30 chars) | `[0][0]` | |
+| Content rating | `[9][0]` | e.g. `"Everyone"` |
+| Released date | `[10][0]` | formatted string, e.g. `"Jan 6, 2026"` |
+| Install range | `[13][0]` | e.g. `"100+"`, `"10K+"`, `"1M+"` |
+| Rating value | `[51][0][1]` | `null` if 0 ratings |
+| Rating count | `[51][2][1]` | `null` if 0 ratings |
+| Formatted price | `[57][0][0][0][0][1][0][0]` | `"0"` for free |
+| Developer name | `[68][0]` | |
+| Full description (HTML) | `[72][0][1]` | supports `<b>`, `<i>`, `<u>`, `<br>`, `<h1>`–`<h3>` |
+| **Screenshots[]** | `[78][0]` | list of items, each has the URL at `item[3][2]` — len is the screenshot count (Play max 8 per device; 10 was seen for phone) |
+| Primary category | `[79][0][0][0]` | e.g. `"Video Players & Editors"` |
+| Icon URL | `[95][0][3][2]` | 512×512 |
+| Feature graphic URL | `[96][0][3][2]` | 1024×500 — absent = missing feature graphic (Play penalty) |
+| Preview video URL | `[100][0][0][3][2]` | YouTube watch URL — Play uses YouTube for previews |
+| Preview video thumbnail | `[100][1][0][3][2]` | poster image |
+| What's New | `[144][1][1]` | per-locale release notes; `null` if not set |
+
+If JSON-LD is also present (some legacy listings), fall back to it. Otherwise grep for `play-lh.googleusercontent.com` URLs in the raw HTML to at least confirm presence.
+
+Then use WebFetch on the public page only if you need fields the above don't expose (visible review text, etc.):
 
 **Apple App Store fields:**
 
@@ -84,14 +184,17 @@ work with what's available. Ask the user to paste missing fields if critical.
 
 ### Visual asset assessment
 
-WebFetch cannot extract screenshot images or caption text. **Take a screenshot
-of the listing page** to get visual data:
+**Always verify presence programmatically first — never punt to `?/10`.**
 
-1. Navigate to the listing URL and capture a full-page screenshot
-2. Assess the screenshot for: icon quality, screenshot count, caption text,
-   messaging quality, preview video presence, feature graphic (Google Play)
-3. If browser tools are unavailable, ask the user to share a screenshot of the
-   listing page
+1. **Apple:** from the SPA hydration block at `data[0].data.shelfMapping`:
+   - `product_media_phone_.items[]` → count items with `screenshot` key (= iPhone screenshots), check for any item with `video` key (= preview video, with `videoUrl` pointing to the `.m3u8`)
+   - `product_media_pad_.items[]` → iPad screenshots / preview video
+   - From the JSON-LD block: `image` → app icon URL
+   - **DO NOT trust iTunes Lookup `screenshotUrls` / `previewMovieUrl`** — they will return empty even when the assets are live. The hydration block is the source of truth.
+2. **Google Play:** from `AF_initDataCallback` `ds:5[1][2]`, count `[78][0]` (screenshots), check `[100][0][0][3][2]` (YouTube preview URL — null/absent = no video), `[95][0][3][2]` (icon), `[96][0][3][2]` (feature graphic — absent is a real ranking penalty on Play). See concrete code in `Fetch the listing` above. DO NOT use JSON-LD on Play — the listing no longer emits it.
+3. **Caption text + visual quality** (composition, message hierarchy, device frames) requires rendering an actual image — fetch each screenshot URL using the `template` with substituted dimensions (e.g. `1290x2796bb.png`), or have the user share one. The image template URL is the per-screenshot canonical reference; the dimensions `{w}x{h}` are interchangeable.
+
+**Scoring rule:** score `0/10` ONLY if `product_media_phone_.items[]` is empty or missing — and even then, double-check the JSON-LD `screenshot[]` field. `?/10` is reserved strictly for: hydration block could not be fetched, parse failed, or the app is region-locked from the auditor's vantage point. **Never score `?/10` because iTunes Lookup said zero** — iTunes Lookup is wrong for screenshots on modern apps.
 
 **Promotional text (Apple):** This 170-char field appears above the description
 but is often indistinguishable from it in scraped HTML. If you cannot confirm
