@@ -2,9 +2,9 @@
 name: aso
 description: "When the user wants to audit or optimize an App Store or Google Play listing. Also use when the user mentions 'ASO audit,' 'app store optimization,' 'optimize my app listing,' 'improve app visibility,' 'app store ranking,' 'audit my listing,' 'why aren't people downloading my app,' 'improve my app conversion,' 'keyword optimization for app,' or 'compare my app to competitors.' Use when the user shares an App Store or Google Play URL and wants to improve it."
 metadata:
-  version: 2.1.0-local.3
+  version: 2.1.0-local.4
   localPatches:
-    - "Mandate Astro ASO MCP (mcp__astro__*) as the primary keyword/ranking/competitor source when available"
+    - "Mandate Wow Keywords (Executor namespace wowkeywords) as the primary keyword/ranking/competitor source for App Store and Google Play when available; Astro is retired"
     - "Apple: parse the `serialized-server-data` SPA block (`data[0].data.shelfMapping.product_media_phone_.items[]`) as the PRIMARY source for screenshots + preview video. iTunes Lookup is stale on modern apps and silently returns empty."
     - "Google Play: parse `AF_initDataCallback` block `ds:5` for screenshots, preview video, icon, feature graphic, description, install range, category, last-updated. Concrete paths in `Fetch the listing`. No JSON-LD on Play."
     - "JSON-LD (Apple only) second for icon + description + aggregateRating; iTunes Lookup third for fields the other two don't expose."
@@ -33,18 +33,19 @@ If `.agents/product-marketing.md` exists (or `.claude/product-marketing.md`, or 
 
 ### Data sources — use in this order
 
-1. **Astro ASO MCP first (when available).** If `mcp__astro__*` tools are exposed, they are the authoritative source for tracked keyword rankings, popularity, difficulty, ratings history, AI keyword suggestions, and competitor app sets. Prefer these over WebFetch for anything keyword-related:
-   - `mcp__astro__list_apps` — confirm the app is tracked and resolve the App Store ID
-   - `mcp__astro__get_app_keywords` — full ranked keyword set with `currentRanking`, `previousRanking`, `rankingChange`, `popularity`, `difficulty`
-   - `mcp__astro__get_app_ratings` — current + historical rating/review counts
-   - `mcp__astro__search_rankings` — per-keyword detail with optional `includeHistory`/`includeStatistics`
-   - `mcp__astro__search_app_store` — top-N apps for a keyword (competitor extraction); pass `appId` to also get your app's position
-   - `mcp__astro__get_keyword_suggestions` — AI-suggested keywords with pop/difficulty
-   - `mcp__astro__extract_competitors_keywords` — keyword ideas mined from competitors ranking for a tracked term
+1. **Wow Keywords first (when available).** Reached through Executor, namespace `wowkeywords`, connection `intel` (see the vendor-tools skill; it needs the Intel Mac awake with the app open). It is the authoritative source for tracked keyword ranks, difficulty, competition, competitors and per-locale metadata, for both the App Store and Google Play. Discover and describe each tool before calling it; read-only for audits:
+   - `status` / `overview` — confirm the app is tracked (App Store id, or Play package with `store: "play"`) and how fresh each market is
+   - `board_get` — every keyword in every tracked market: rank, prior rank, competition proxy 0-100, difficulty 0-100, verdict (keep/push/target/maybe/review/hard), top 5 competitors, and each locale's live name, subtitle and keyword field
+   - `term_get` — one keyword in one market: daily rank history and the top ~20 apps for that search with their ratings
+   - `audit_get` — Wow's own metadata audit: current vs proposed fields per locale (proposals are not live)
+   - `store_search` — top apps for a term in one store (`store: "play"` for Google Play); `app_facts` — rating, rating count, version for app ids
+   - `astro_get` — Astro's last imported popularity and best ranks, a dated reference only
+   - The competition proxy counts relevant apps in the results; it is NOT search demand. Google Play ranks cover only the first results page.
+   - Never call `check_run`, `keyword_*`, `app_*`, `audit_publish`, `screens_publish`, `asc_connect` or `play_connect` during an audit; they change tracking or publish to the stores.
 2. **Apple iTunes Lookup API + Google Play JSON-LD second.** These are programmatic and expose creative URLs (icon, screenshots, preview video) that the rendered page does not — see "Fetch the listing" below.
 3. **WebFetch on the public listing third.** Useful for human-visible truth (placeholder `1x1.gif` blocks vs real screenshots, "What's New" copy, brand voice) but the page renders client-side so it will under-report creatives that ARE live.
 
-If Astro MCP is not available, skip step 1 and proceed with steps 2 and 3.
+If Wow Keywords is not reachable, skip step 1, say so in the report, and proceed with steps 2 and 3.
 
 ### Detect store type from URL
 
